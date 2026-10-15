@@ -83,12 +83,46 @@ def _get_default_model_profile(model_name: str) -> ModelProfile:
     return default.copy()
 
 
+def _routed_provider(response: dict[str, Any]) -> str | None:
+    """Return the upstream provider that served a response or stream chunk.
+
+    The wire carries a top-level `provider`, but the `openrouter` SDK's response
+    models don't declare it, so `model_dump` drops it. With routing metadata
+    opted into (`x_open_router_metadata="enabled"`), the selected endpoint in
+    `openrouter_metadata` names the same provider; when streaming it arrives on
+    the final chunk.
+    """
+    if provider := response.get("provider"):
+        return provider
+    endpoints = (response.get("openrouter_metadata") or {}).get("endpoints") or {}
+    for endpoint in endpoints.get("available") or []:
+        if endpoint.get("selected") and endpoint.get("provider"):
+            return endpoint["provider"]
+    return None
+
+
+def _stream_error_message(error: dict[str, Any]) -> str:
+    message = (
+        f"OpenRouter API returned an error during streaming: "
+        f"{error.get('message', str(error))} "
+        f"(code: {error.get('code', 'unknown')})"
+    )
+    metadata = error.get("metadata") or {}
+    if typed := [
+        f"{key}={metadata[key]}"
+        for key in ("error_type", "provider_code")
+        if metadata.get(key)
+    ]:
+        message += f" [{', '.join(typed)}]"
+    return message
+
+
 def _create_stream_generation_info(
     chunk_dict: dict[str, Any], choice: dict[str, Any], model_name: str
 ) -> dict[str, Any]:
     generation_info = {"finish_reason": choice["finish_reason"]}
     generation_info["model_name"] = chunk_dict.get("model") or model_name
-    if provider := chunk_dict.get("provider"):
+    if provider := _routed_provider(chunk_dict):
         generation_info["provider"] = provider
     if system_fingerprint := chunk_dict.get("system_fingerprint"):
         generation_info["system_fingerprint"] = system_fingerprint
@@ -607,14 +641,10 @@ class ChatOpenRouter(BaseChatModel):
         terminal_generation_info: dict[str, Any] = {}
         for chunk in self.client.chat.send(messages=message_dicts, **params):
             chunk_dict = chunk.model_dump(by_alias=True)
+            # A mid-stream error also carries a choice with finish_reason "error".
+            if error := chunk_dict.get("error"):
+                raise ValueError(_stream_error_message(error))
             if not chunk_dict.get("choices"):
-                if error := chunk_dict.get("error"):
-                    msg = (
-                        f"OpenRouter API returned an error during streaming: "
-                        f"{error.get('message', str(error))} "
-                        f"(code: {error.get('code', 'unknown')})"
-                    )
-                    raise ValueError(msg)
                 # Usage-only chunk (no choices) — emit with usage_metadata
                 if usage := chunk_dict.get("usage"):
                     usage_metadata = _create_usage_metadata(usage)
@@ -699,14 +729,10 @@ class ChatOpenRouter(BaseChatModel):
             messages=message_dicts, **params
         ):
             chunk_dict = chunk.model_dump(by_alias=True)
+            # A mid-stream error also carries a choice with finish_reason "error".
+            if error := chunk_dict.get("error"):
+                raise ValueError(_stream_error_message(error))
             if not chunk_dict.get("choices"):
-                if error := chunk_dict.get("error"):
-                    msg = (
-                        f"OpenRouter API returned an error during streaming: "
-                        f"{error.get('message', str(error))} "
-                        f"(code: {error.get('code', 'unknown')})"
-                    )
-                    raise ValueError(msg)
                 # Usage-only chunk (no choices) — emit with usage_metadata
                 if usage := chunk_dict.get("usage"):
                     usage_metadata = _create_usage_metadata(usage)
@@ -852,7 +878,7 @@ class ChatOpenRouter(BaseChatModel):
         # Extract top-level response metadata
         response_model = response.get("model")
         system_fingerprint = response.get("system_fingerprint")
-        provider = response.get("provider")
+        provider = _routed_provider(response)
 
         for res in choices:
             message = _convert_dict_to_message(res["message"])

@@ -32,6 +32,7 @@ from langchain_openrouter.chat_models import (
     _create_stream_generation_info,
     _create_usage_metadata,
     _format_message_content,
+    _stream_error_message,
 )
 
 MODEL_NAME = "openai/gpt-5.5"
@@ -3779,3 +3780,214 @@ def test_profile() -> None:
     """Test that the model has a profile."""
     model = _make_model()
     assert model.profile
+
+
+# ===========================================================================
+# Responses parsed by the openrouter SDK's own models
+# ===========================================================================
+
+# Shapes captured from live `POST /api/v1/chat/completions` calls with
+# `X-OpenRouter-Metadata: enabled`. The wire carries a top-level `provider` on
+# every chunk, but the SDK's `ChatResult` and `ChatStreamChunk` don't declare it.
+_ROUTING_METADATA: dict[str, Any] = {
+    "requested": "z-ai/glm-5.3-flash",
+    "strategy": "direct",
+    "region": "EWR",
+    "summary": "available=2, attempts=2, selected=BaseTen",
+    "attempt": 2,
+    "is_byok": False,
+    "endpoints": {
+        "total": 34,
+        "available": [
+            {"provider": "Together", "model": "z-ai/glm-5.3-flash", "selected": False},
+            {"provider": "BaseTen", "model": "z-ai/glm-5.3-flash", "selected": True},
+        ],
+    },
+    "attempts": [
+        {"provider": "Together", "model": "z-ai/glm-5.3-flash", "status": 429},
+        {"provider": "BaseTen", "model": "z-ai/glm-5.3-flash", "status": 200},
+    ],
+}
+
+
+def _wire_chunk(**fields: Any) -> dict[str, Any]:
+    return {
+        "id": "gen-1",
+        "object": "chat.completion.chunk",
+        "created": 1700000000,
+        "model": "z-ai/glm-5.3-flash",
+        "provider": "BaseTen",
+        **fields,
+    }
+
+
+def _wire_stream(*, with_metadata: bool) -> list[dict[str, Any]]:
+    final: dict[str, Any] = {
+        "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+    }
+    if with_metadata:
+        final["openrouter_metadata"] = _ROUTING_METADATA
+    return [
+        _wire_chunk(
+            choices=[{"index": 0, "delta": {"content": "ok"}, "finish_reason": None}]
+        ),
+        _wire_chunk(
+            choices=[{"index": 0, "delta": {"content": ""}, "finish_reason": "stop"}]
+        ),
+        _wire_chunk(**final),
+    ]
+
+
+# The mid-stream error example from OpenRouter's errors documentation.
+_WIRE_MID_STREAM_ERROR: dict[str, Any] = {
+    "id": "gen-abc123",
+    "object": "chat.completion.chunk",
+    "created": 1234567890,
+    "model": "openai/gpt-4o",
+    "provider": "OpenAI",
+    "error": {
+        "code": 429,
+        "message": "Rate limit exceeded",
+        "metadata": {"error_type": "rate_limit_exceeded"},
+    },
+    "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "error"}],
+}
+
+_WIRE_PARTIAL_CHUNK: dict[str, Any] = _wire_chunk(
+    choices=[{"index": 0, "delta": {"content": "par"}, "finish_reason": None}]
+)
+
+
+class _SdkSyncStream:
+    """Yields each wire chunk as the SDK parses it into a `ChatStreamChunk`."""
+
+    def __init__(self, chunks: list[dict[str, Any]]) -> None:
+        from openrouter import components  # noqa: PLC0415
+
+        self._chunks = [components.ChatStreamChunk.model_validate(c) for c in chunks]
+
+    def __iter__(self) -> Any:
+        return iter(self._chunks)
+
+
+class _SdkAsyncStream(_SdkSyncStream):
+    def __aiter__(self) -> _SdkAsyncStream:
+        self._iterator = iter(self._chunks)
+        return self
+
+    async def __anext__(self) -> Any:
+        try:
+            return next(self._iterator)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+
+def _merged(chunks: list[Any]) -> Any:
+    merged = chunks[0]
+    for chunk in chunks[1:]:
+        merged = merged + chunk
+    return merged
+
+
+class TestSdkResponseModels:
+    """Responses as the SDK delivers them, not as raw dicts."""
+
+    def test_sdk_models_drop_the_top_level_provider(self) -> None:
+        """Why the provider has to come from `openrouter_metadata`."""
+        from openrouter import components  # noqa: PLC0415
+
+        chunk = components.ChatStreamChunk.model_validate(_WIRE_PARTIAL_CHUNK)
+        assert "provider" not in chunk.model_dump(by_alias=True)
+
+    def test_provider_from_routing_metadata_in_chat_result(self) -> None:
+        from openrouter import components  # noqa: PLC0415
+
+        response = components.ChatResult.model_validate(
+            {
+                "id": "gen-1",
+                "object": "chat.completion",
+                "created": 1700000000,
+                "model": "z-ai/glm-5.3-flash",
+                "provider": "BaseTen",
+                "system_fingerprint": None,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "total_tokens": 12,
+                },
+                "openrouter_metadata": _ROUTING_METADATA,
+            }
+        )
+        result = _make_model()._create_chat_result(response)
+        assert result.generations[0].message.response_metadata["provider"] == "BaseTen"
+
+    def test_stream_provider_from_routing_metadata_on_the_final_chunk(self) -> None:
+        model = _make_model()
+        model.client = MagicMock()
+        model.client.chat.send.return_value = _SdkSyncStream(
+            _wire_stream(with_metadata=True)
+        )
+        merged = _merged(list(model.stream("Hello")))
+        assert merged.response_metadata["provider"] == "BaseTen"
+
+    async def test_astream_provider_from_routing_metadata_on_the_final_chunk(
+        self,
+    ) -> None:
+        model = _make_model()
+        model.client = MagicMock()
+        model.client.chat.send_async = AsyncMock(
+            return_value=_SdkAsyncStream(_wire_stream(with_metadata=True))
+        )
+        merged = _merged([c async for c in model.astream("Hello")])
+        assert merged.response_metadata["provider"] == "BaseTen"
+
+    def test_stream_without_routing_metadata_has_no_provider(self) -> None:
+        model = _make_model()
+        model.client = MagicMock()
+        model.client.chat.send.return_value = _SdkSyncStream(
+            _wire_stream(with_metadata=False)
+        )
+        merged = _merged(list(model.stream("Hello")))
+        assert "provider" not in merged.response_metadata
+
+    def test_mid_stream_error_with_a_terminating_choice_raises(self) -> None:
+        model = _make_model()
+        model.client = MagicMock()
+        model.client.chat.send.return_value = _SdkSyncStream(
+            [_WIRE_PARTIAL_CHUNK, _WIRE_MID_STREAM_ERROR]
+        )
+        with pytest.raises(ValueError, match=r"Rate limit exceeded \(code: 429\)"):
+            list(model.stream("Hello"))
+
+    async def test_amid_stream_error_with_a_terminating_choice_raises(self) -> None:
+        model = _make_model()
+        model.client = MagicMock()
+        model.client.chat.send_async = AsyncMock(
+            return_value=_SdkAsyncStream([_WIRE_PARTIAL_CHUNK, _WIRE_MID_STREAM_ERROR])
+        )
+        with pytest.raises(ValueError, match=r"Rate limit exceeded \(code: 429\)"):
+            _ = [c async for c in model.astream("Hello")]
+
+    def test_stream_error_message_carries_the_typed_error_code(self) -> None:
+        """SDKs that model `error.metadata` (openrouter>=0.11) keep the typed code."""
+        error = {
+            "code": 502,
+            "message": "Provider returned error",
+            "metadata": {
+                "error_type": "provider_unavailable",
+                "provider_code": "upstream_502",
+            },
+        }
+        assert _stream_error_message(error) == (
+            "OpenRouter API returned an error during streaming: Provider returned "
+            "error (code: 502) [error_type=provider_unavailable, "
+            "provider_code=upstream_502]"
+        )
