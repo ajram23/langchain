@@ -2,7 +2,8 @@
 
 This repository is a fork of [langchain-ai/langchain](https://github.com/langchain-ai/langchain).
 Orbit uses only `libs/partners/openrouter`, pinned to tag `langchain-openrouter==0.2.9`,
-with two fixes on branch `orbit-langchain-openrouter-0.2.9`. Nothing else in the
+with two fixes and upstream's `openrouter<1.0.0` cap removal (`dbc7b8754`) on branch
+`orbit-langchain-openrouter-0.2.9`. Nothing else in the
 monorepo is changed.
 
 ## What's changed vs. upstream langchain-openrouter 0.2.9
@@ -36,11 +37,11 @@ fixture through the SDK's own models. Five of its tests fail on stock 0.2.9.
 
 ## Orbit tag
 
-`langchain-openrouter-0.2.9.post1`, a PEP 440 post-release of upstream `0.2.9`
+`langchain-openrouter-0.2.9.post2`, a PEP 440 post-release of upstream `0.2.9`
 (same convention as Orbit's fastmcp fork, `v2.14.4.post1`).
 
 ```
-langchain-openrouter @ git+https://github.com/ajram23/langchain@langchain-openrouter-0.2.9.post1#subdirectory=libs/partners/openrouter
+langchain-openrouter @ git+https://github.com/ajram23/langchain@langchain-openrouter-0.2.9.post2#subdirectory=libs/partners/openrouter
 ```
 
 ## When to retire this fork
